@@ -3,6 +3,7 @@ import os
 
 from typing import List, Optional, Tuple
 
+import json
 import cv2
 import numpy as np
 import pandas as pd
@@ -12,6 +13,7 @@ from PIL import Image
 
 from custom_dataclasses import ExtractedTable, ExtractionResult
 from preprocessing import preprocess_crop_for_paddle, preprocess_page_for_detection, bgr_to_pil, pil_to_bgr, pdf_bytes_to_images
+from triplet_extractor import extract_triplets_by_llm
 
 # убираем NaN и лишние пробелы
 def sanitize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -403,6 +405,29 @@ def show_file_preview(uploaded_file, file_type: str):
     st.image(raw, caption="Превью скана", width='stretch')
 
 # вывод таблицы и добавления сохранения файла в эксель
+# def render_result(result: ExtractionResult, prefix: str):
+#     st.write(f"Метод обработки: `{result.method}`")
+#     if not result.tables:
+#         st.warning("Таблицы не найдены.")
+#         return
+
+#     for idx, table in enumerate(result.tables, start=1):
+#         st.markdown(f"**Таблица {idx}**")
+#         st.caption(table.source)
+#         st.dataframe(table.dataframe, width='stretch')
+
+#     try:
+#         excel_bytes = build_excel_bytes(result.tables)
+#         st.download_button(
+#             "Скачать Excel",
+#             data=excel_bytes,
+#             file_name=f"{prefix}_tables.xlsx",
+#             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+#             key=f"download_{prefix}",
+#         )
+#     except Exception as exc:
+#         st.error("Не удалось собрать Excel-файл.")
+
 def render_result(result: ExtractionResult, prefix: str):
     st.write(f"Метод обработки: `{result.method}`")
     if not result.tables:
@@ -412,7 +437,7 @@ def render_result(result: ExtractionResult, prefix: str):
     for idx, table in enumerate(result.tables, start=1):
         st.markdown(f"**Таблица {idx}**")
         st.caption(table.source)
-        st.dataframe(table.dataframe, width='stretch')
+        st.dataframe(table.dataframe, width="stretch")
 
     try:
         excel_bytes = build_excel_bytes(result.tables)
@@ -424,7 +449,46 @@ def render_result(result: ExtractionResult, prefix: str):
             key=f"download_{prefix}",
         )
     except Exception as exc:
-        st.error("Не удалось собрать Excel-файл.")
+        st.error(f"Не удалось собрать Excel-файл: {exc}")
+
+    st.markdown("---")
+    st.subheader("Извлечение триплетов")
+
+    triplets_key = f"{prefix}_triplets"
+    triplets_error_key = f"{prefix}_triplets_error"
+
+    if st.button("Извлечь триплеты", key=f"extract_triplets_{prefix}"):
+        try:
+            with st.spinner("Извлекаю триплеты..."):
+                triplets_result = extract_triplets_by_llm(result)
+                st.session_state[triplets_key] = triplets_result
+                st.session_state[triplets_error_key] = ""
+        except Exception as exc:
+            st.session_state[triplets_key] = None
+            st.session_state[triplets_error_key] = str(exc)
+
+    triplets_error = st.session_state.get(triplets_error_key, "")
+    triplets_result = st.session_state.get(triplets_key)
+
+    if triplets_error:
+        st.error(f"Ошибка извлечения триплетов: {triplets_error}")
+    elif triplets_result is not None:
+        st.write("Результат извлечения:")
+        st.json(triplets_result)
+
+        json_bytes = json.dumps(
+            triplets_result,
+            ensure_ascii=False,
+            indent=2
+        ).encode("utf-8")
+
+        st.download_button(
+            "Скачать JSON с триплетами",
+            data=json_bytes,
+            file_name=f"{prefix}_triplets.json",
+            mime="application/json",
+            key=f"download_triplets_{prefix}",
+        )
 # просто логика работы и отрисовка страницы
 def main():
     st.set_page_config(page_title="Table Extraction", layout="wide")
@@ -468,6 +532,8 @@ def main():
                         result = build_table_from_ocr_json(process_textlike_tables(raw))
                     st.session_state["main_result"] = result
                     st.session_state["main_error"] = ""
+                    st.session_state["main_triplets"] = None
+                    st.session_state["main_triplets_error"] = ""
             except Exception as exc:
                 st.session_state["main_result"] = None
                 st.session_state["main_error"] = str(exc)
@@ -498,6 +564,8 @@ def main():
                     shot_result = process_screenshot(screenshot.getvalue())
                     st.session_state["shot_result"] = shot_result
                     st.session_state["shot_error"] = ""
+                    st.session_state["screenshot_triplets"] = None
+                    st.session_state["screenshot_triplets_error"] = ""
             except Exception as exc:
                 st.session_state["shot_result"] = None
                 st.session_state["shot_error"] = str(exc)
