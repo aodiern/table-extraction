@@ -3,16 +3,6 @@ from typing import List
 import pandas as pd
 import numpy as np
 
-# класс для детектированного ббокса таблицы
-@dataclass
-class DetectedBox:
-    x: int
-    y: int
-    w: int
-    h: int
-    score: float
-    label: str
-
 # класс извлеченной таблицы
 @dataclass
 class ExtractedTable:

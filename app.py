@@ -10,11 +10,8 @@ import pdfplumber
 import streamlit as st
 from PIL import Image
 
-from custom_dataclasses import DetectedBox, ExtractedTable, ExtractionResult
+from custom_dataclasses import ExtractedTable, ExtractionResult
 from preprocessing import preprocess_crop_for_paddle, preprocess_page_for_detection, bgr_to_pil, pil_to_bgr, pdf_bytes_to_images
-
-TABLE_MODEL_ID = "microsoft/table-transformer-detection"
-TABLE_SCORE_THRESHOLD = 0.7
 
 # убираем NaN и лишние пробелы
 def sanitize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
@@ -37,26 +34,6 @@ def rows_to_dataframe(rows: List[List[str]]) -> Optional[pd.DataFrame]:
     width = max(len(r) for r in cleaned_rows)
     padded = [r + [""] * (width - len(r)) for r in cleaned_rows]
     return sanitize_dataframe(pd.DataFrame(padded))
-
-# --------------------------------- ЗАГРУЗКА ДЕТЕКТОРА ТАБЛИЦ ---------------------------------
-# @st.cache_resource(show_spinner=False)
-# def load_table_transformer():
-#     import torch
-#     from transformers import AutoImageProcessor, TableTransformerForObjectDetection
-#     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-#     try:
-#         processor = AutoImageProcessor.from_pretrained(TABLE_MODEL_ID)
-#         model = TableTransformerForObjectDetection.from_pretrained(TABLE_MODEL_ID)
-#         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-#         model.to(device)
-#         model.eval()
-#         print("loaded table detector")
-#         return {"processor": processor, "model": model, "device": device, "error": None}
-#     except Exception as exc:
-#         raise exc
-#         # return {"processor": None, "model": None, "device": None, "error": str(exc)}
-
-
 
 # --------------------------------- PADDLE OCR ДЛЯ ТАБЛИЦ---------------------------------
 @st.cache_resource(show_spinner=False)
@@ -144,83 +121,29 @@ def extract_tables_with_paddle(crop_bgr: np.ndarray) -> List[pd.DataFrame]:
     print(f"Paddle OCR extracted {len(frames)} table frame(s) from crop")
     return frames
 
-# для отрисовки ббоксов на документах
-def draw_boxes(image_bgr: np.ndarray, boxes: List[DetectedBox]) -> np.ndarray:
-    debug = image_bgr.copy()
-    for box in boxes:
-        cv2.rectangle(
-            debug,
-            (box.x, box.y),
-            (box.x + box.w, box.y + box.h),
-            (0, 180, 0),
-            2,
-        )
-        text = f"{box.label} {box.score:.2f}" if box.score else box.label
-        cv2.putText(
-            debug,
-            text,
-            (box.x, max(15, box.y - 4)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.45,
-            (0, 180, 0),
-            1,
-            cv2.LINE_AA,
-        )
-    return debug
-
-# функция для паддинга найденного ббокса таблицы
-def expand_box(box, img_shape, pad_x=12, pad_y=12): 
-    h, w = img_shape[:2]
-    x1 = max(0, box.x - pad_x)
-    y1 = max(0, box.y - pad_y)
-    x2 = min(w, box.x + box.w + pad_x)
-    y2 = min(h, box.y + box.h + pad_y)
-    return DetectedBox(
-        x=x1,
-        y=y1,
-        w=x2 - x1,
-        h=y2 - y1,
-        score=box.score,
-        label=box.label,
-    )
-
-# --------------------------------- ОБРАБОТКА КАРТИНОК С ДЕТЕКТОРОМ ---------------------------------
+# --------------------------------- ОБРАБОТКА КАРТИНОК  ---------------------------------
 def process_images_with_detector(images_bgr: List[np.ndarray], source_name: str) -> ExtractionResult:
     all_tables: List[ExtractedTable] = []
     debug_images: List[np.ndarray] = []
 
     for page_idx, raw_page in enumerate(images_bgr, start=1):
         page = preprocess_page_for_detection(raw_page)
-        # boxes, detector_error = detect_table_regions_transformer(page)
-        # if detector_error:
-        #     print(f"Transformer detector error on page {page_idx}: {detector_error}")
-        # if not boxes:
-        boxes = [DetectedBox(0, 0, page.shape[1], page.shape[0], 0.0, "full_page")]
-        print(f"No table boxes found, fallback to full-page OCR on page {page_idx}")
-
-        debug_images.append(draw_boxes(page, boxes))
-        # print(boxes)
-        for box_idx, box in enumerate(boxes, start=1):
-            box = expand_box(box, page.shape, pad_x=300, pad_y=30) # чуть расширим ббокс найденной таблицы, 
-                                                                # в особенности по оси x из-за того что может быть смещенный результат детекции и влияет на распознавания текста, выяавлено и настроено эмпирически
-            crop = page[box.y : box.y + box.h, box.x : box.x + box.w]
-            prepared_crop = preprocess_crop_for_paddle(crop) # обрежем файл по найденному ббоксу
-            tables = extract_tables_with_paddle(prepared_crop) # уже из обрезанного варианта извлечем таблицы
-            if not tables:
-                continue
-            for table_idx, df in enumerate(tables, start=1):
-                all_tables.append(
-                    ExtractedTable(
-                        source=(
-                            f"Page {page_idx}, box {box_idx}, table {table_idx} "
-                            f"({box.label})"
-                        ),
-                        dataframe=df,
-                    )
+        prepared_crop = preprocess_crop_for_paddle(page) # обрежем файл по найденному ббоксу
+        tables = extract_tables_with_paddle(prepared_crop) # уже из обрезанного варианта извлечем таблицы
+        if not tables:
+            continue
+        for table_idx, df in enumerate(tables, start=1):
+            all_tables.append(
+                ExtractedTable(
+                    source=(
+                        f"Page {page_idx}, table {table_idx}"
+                    ),
+                    dataframe=df,
                 )
-    method = f"{TABLE_MODEL_ID} + PaddleOCR"
+            )
+    method = f"PP Structure V3"
     return ExtractionResult(method=method, tables=all_tables, debug_images=debug_images)
-# --------------------------------- ИЗВЛЕЧЕНИЕ TEXT LIKE ТАБЛИЦ ---------------------------------
+# --------------------------------- ИЗВЛЕЧЕНИЕ TEXT LIKE ТАБЛИЦ (или таблиц с объединенными вертикально клетками) ---------------------------------
 def process_images_with_ocr(image_bgr: np.ndarray, source_name: str):
     from paddleocr import PaddleOCR
     ocr = PaddleOCR(
@@ -502,16 +425,6 @@ def render_result(result: ExtractionResult, prefix: str):
         )
     except Exception as exc:
         st.error("Не удалось собрать Excel-файл.")
-
-    # if result.debug_images:
-    #     with st.expander("Найденные области таблиц", expanded=False):
-    #         for page_idx, debug in enumerate(result.debug_images, start=1):
-    #             st.image(
-    #                 cv2.cvtColor(debug, cv2.COLOR_BGR2RGB),
-    #                 caption=f"Страница {page_idx}",
-    #                 width='stretch',
-    #             )
-
 # просто логика работы и отрисовка страницы
 def main():
     st.set_page_config(page_title="Table Extraction", layout="wide")
