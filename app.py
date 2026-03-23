@@ -1,3 +1,4 @@
+import io
 import os
 import sys
 
@@ -10,8 +11,8 @@ os.environ["PADDLE_USE_GPU"] = "0"
 os.environ["CUDA_VISIBLE_DEVICES"] = ""
 # ===================================================
 
+import json
 # Now import the rest of your libraries
-import io
 import streamlit as st
 import torch
 from transformers import AutoImageProcessor, TableTransformerForObjectDetection
@@ -19,11 +20,14 @@ import cv2
 import numpy as np
 import pandas as pd
 import pdfplumber
+import streamlit as st
 from PIL import Image
 from typing import List, Optional, Tuple
 from dataclasses import dataclass
 
 from custom_dataclasses import ExtractedTable, ExtractionResult
+from preprocessing import preprocess_crop_for_paddle, preprocess_page_for_detection, bgr_to_pil, pil_to_bgr, pdf_bytes_to_images
+from triplet_extractor import extract_triplets_by_llm
 from preprocessing import preprocess_crop_for_paddle, preprocess_page_for_detection, bgr_to_pil, pil_to_bgr, \
     pdf_bytes_to_images
 # Import paddle and set device
@@ -59,7 +63,6 @@ def sanitize_dataframe(df: pd.DataFrame) -> pd.DataFrame:
     cleaned = cleaned.loc[:, (cleaned != "").any(axis=0)]
     return cleaned.reset_index(drop=True)
 
-
 # преобразуем строки в датафрейм (для случая pdfplumber)
 def rows_to_dataframe(rows: List[List[str]]) -> Optional[pd.DataFrame]:
     cleaned_rows: List[List[str]] = []
@@ -72,7 +75,6 @@ def rows_to_dataframe(rows: List[List[str]]) -> Optional[pd.DataFrame]:
     width = max(len(r) for r in cleaned_rows)
     padded = [r + [""] * (width - len(r)) for r in cleaned_rows]
     return sanitize_dataframe(pd.DataFrame(padded))
-
 
 # --------------------------------- PADDLE OCR ДЛЯ ТАБЛИЦ---------------------------------
 @st.cache_resource(show_spinner=False)
@@ -196,7 +198,7 @@ def html_to_dataframes(table_html: str) -> List[pd.DataFrame]:
             decimal=",",
             thousands=" ",
             keep_default_na=False
-        )  # разделитель для нецелых чисел это запятая. Если не указать явно, не будет считываться 0,67, результат будет 067.
+        ) # разделитель для нецелых чисел это запятая. Если не указать явно, не будет считываться 0,67, результат будет 067. 
         # Но будет плохо работать в случае если разделителем будет точка.
     except ValueError:
         return []
@@ -206,7 +208,6 @@ def html_to_dataframes(table_html: str) -> List[pd.DataFrame]:
         if not cleaned.empty:
             frames.append(cleaned)
     return frames
-
 
 # --------------------------------- НЕПОСРЕДСТВЕННО РАСПОЗНАВАНИЕ ТАБЛИЦ ---------------------------------
 def extract_tables_with_paddle(crop_bgr: np.ndarray) -> List[pd.DataFrame]:
@@ -227,7 +228,6 @@ def extract_tables_with_paddle(crop_bgr: np.ndarray) -> List[pd.DataFrame]:
         frames.extend(html_to_dataframes(html))
     print(f"Paddle OCR extracted {len(frames)} table frame(s) from crop")
     return frames
-
 
 # --------------------------------- ОБРАБОТКА КАРТИНОК  ---------------------------------
 def process_images_with_detector(images_bgr: List[np.ndarray], source_name: str) -> ExtractionResult:
@@ -255,8 +255,6 @@ def process_images_with_detector(images_bgr: List[np.ndarray], source_name: str)
         log_processing(f"PP Structure V3: found {len(tables)} table(s) on page {page_idx}")
     method = f"PP Structure V3"
     return ExtractionResult(method=method, tables=all_tables, debug_images=debug_images)
-
-
 # --------------------------------- ИЗВЛЕЧЕНИЕ TEXT LIKE ТАБЛИЦ (или таблиц с объединенными вертикально клетками) ---------------------------------
 def process_images_with_ocr(image_bgr: np.ndarray, source_name: str):
     log_processing(f"PaddleOCR: running OCR for source={source_name}")
@@ -265,7 +263,8 @@ def process_images_with_ocr(image_bgr: np.ndarray, source_name: str):
     json_results = []
     for res in result:
         res.print()
-        json_results.append(res.json)
+        res.save_to_img("output")
+        json_results.append(res.json) 
     return json_results
 
 
@@ -698,7 +697,6 @@ def calculate_overlapping(a, b):
     bottom = min(a["y2"], b["y2"])
     return max(0, bottom - top)
 
-
 def estimate_y_threshold(items, user_threshold=None):
     if user_threshold is not None:
         return user_threshold
@@ -750,7 +748,7 @@ def cluster_column_centers(rows, x_tolerance):
 def build_table_from_ocr_json(ocr_result, y_threshold=None, x_tolerance=None) -> ExtractionResult:
     if not ocr_result:
         raise ValueError("OCR result is empty")
-
+    
     page = ocr_result[0].get("res", ocr_result[0])
 
     rec_texts = page.get("rec_texts", [])
@@ -794,8 +792,8 @@ def build_table_from_ocr_json(ocr_result, y_threshold=None, x_tolerance=None) ->
         row_height = row_proto["y2"] - row_proto["y1"]
 
         same_row = (
-                abs(item["cy"] - row_center) <= max(y_threshold, row_height * 0.35)
-                or calculate_overlapping(item, row_proto) >= min((item["y2"] - item["y1"]), row_height) * 0.25
+            abs(item["cy"] - row_center) <= max(y_threshold, row_height * 0.35)
+            or calculate_overlapping(item, row_proto) >= min((item["y2"] - item["y1"]), row_height) * 0.25
         )
 
         if same_row:
@@ -902,11 +900,13 @@ def process_scan(uploaded_name: str, raw_bytes: bytes) -> ExtractionResult:
         log_processing("Scan mode: input=image, pages=1")
     return process_images_with_detector(pages, source_name="scan")
 
-
 def process_screenshot(raw_bytes: bytes) -> ExtractionResult:
     image = pil_to_bgr(Image.open(io.BytesIO(raw_bytes)))
     return process_images_with_detector([image], source_name="screenshot")
 
+def process_textlike_tables(raw_bytes: bytes):
+    image = pil_to_bgr(Image.open(io.BytesIO(raw_bytes)))
+    return process_images_with_ocr(image, source_name="textlike")
 
 def build_excel_bytes(tables: List[ExtractedTable]) -> bytes:
     output = io.BytesIO()
@@ -916,7 +916,6 @@ def build_excel_bytes(tables: List[ExtractedTable]) -> bytes:
             table.dataframe.to_excel(writer, sheet_name=sheet_name[:31], index=True)
     output.seek(0)
     return output.read()
-
 
 # для вывода на экран пдф документа
 def show_file_preview(uploaded_file, file_type: str):
@@ -938,8 +937,30 @@ def show_file_preview(uploaded_file, file_type: str):
         return
     st.image(raw, caption="Превью скана", width='stretch')
 
-
 # вывод таблицы и добавления сохранения файла в эксель
+# def render_result(result: ExtractionResult, prefix: str):
+#     st.write(f"Метод обработки: `{result.method}`")
+#     if not result.tables:
+#         st.warning("Таблицы не найдены.")
+#         return
+
+#     for idx, table in enumerate(result.tables, start=1):
+#         st.markdown(f"**Таблица {idx}**")
+#         st.caption(table.source)
+#         st.dataframe(table.dataframe, width='stretch')
+
+#     try:
+#         excel_bytes = build_excel_bytes(result.tables)
+#         st.download_button(
+#             "Скачать Excel",
+#             data=excel_bytes,
+#             file_name=f"{prefix}_tables.xlsx",
+#             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+#             key=f"download_{prefix}",
+#         )
+#     except Exception as exc:
+#         st.error("Не удалось собрать Excel-файл.")
+
 def render_result(result: ExtractionResult, prefix: str):
     st.write(f"Метод обработки: `{result.method}`")
     if not result.tables:
@@ -949,7 +970,7 @@ def render_result(result: ExtractionResult, prefix: str):
     for idx, table in enumerate(result.tables, start=1):
         st.markdown(f"**Таблица {idx}**")
         st.caption(table.source)
-        st.dataframe(table.dataframe, width='stretch')
+        st.dataframe(table.dataframe, width="stretch")
 
     try:
         excel_bytes = build_excel_bytes(result.tables)
@@ -961,9 +982,46 @@ def render_result(result: ExtractionResult, prefix: str):
             key=f"download_{prefix}",
         )
     except Exception as exc:
-        st.error("Не удалось собрать Excel-файл.")
+        st.error(f"Не удалось собрать Excel-файл: {exc}")
 
+    st.markdown("---")
+    st.subheader("Извлечение триплетов")
 
+    triplets_key = f"{prefix}_triplets"
+    triplets_error_key = f"{prefix}_triplets_error"
+
+    if st.button("Извлечь триплеты", key=f"extract_triplets_{prefix}"):
+        try:
+            with st.spinner("Извлекаю триплеты..."):
+                triplets_result = extract_triplets_by_llm(result)
+                st.session_state[triplets_key] = triplets_result
+                st.session_state[triplets_error_key] = ""
+        except Exception as exc:
+            st.session_state[triplets_key] = None
+            st.session_state[triplets_error_key] = str(exc)
+
+    triplets_error = st.session_state.get(triplets_error_key, "")
+    triplets_result = st.session_state.get(triplets_key)
+
+    if triplets_error:
+        st.error(f"Ошибка извлечения триплетов: {triplets_error}")
+    elif triplets_result is not None:
+        st.write("Результат извлечения:")
+        st.json(triplets_result)
+
+        json_bytes = json.dumps(
+            triplets_result,
+            ensure_ascii=False,
+            indent=2
+        ).encode("utf-8")
+
+        st.download_button(
+            "Скачать JSON с триплетами",
+            data=json_bytes,
+            file_name=f"{prefix}_triplets.json",
+            mime="application/json",
+            key=f"download_triplets_{prefix}",
+        )
 # просто логика работы и отрисовка страницы
 def main():
     st.set_page_config(page_title="Table Extraction", layout="wide")
@@ -986,7 +1044,7 @@ def main():
             allowed_types = ["pdf"]
         else:
             file_type = "text"
-            allowed_types = ["pdf", "png", "jpeg", "jpg"]
+            allowed_types = ["png", "jpeg", "jpg"]
 
         uploaded = st.file_uploader("Загрузите файл", type=allowed_types, key="main_upload")  # загрузка файла
         show_file_preview(uploaded, file_type)
@@ -996,19 +1054,20 @@ def main():
             type="primary",
             disabled=uploaded is None,
         )
-        if run and uploaded is not None:  # запуск распознавания если файл загружен и нажата кнопка извлечения таблиц
+        if run and uploaded is not None: # запуск распознавания если файл загружен и нажата кнопка извлечения таблиц
             try:
                 with st.spinner("Идет обработка..."):
                     raw = uploaded.getvalue()
                     if file_type == "born_digital":
-                        result = process_born_digital_pdf(
-                            raw)  # если пдф цифровой а не скан, то просто достаем таблицу через pdfplumber
+                        result = process_born_digital_pdf(raw) # если пдф цифровой а не скан, то просто достаем таблицу через pdfplumber
                     elif file_type == "scan":
-                        result = process_scan(uploaded.name, raw)  # иначе запускаем OCR
+                        result = process_scan(uploaded.name, raw) # иначе запускаем OCR
                     else:
-                        result = process_textlike_document(uploaded.name, raw)
+                        result = build_table_from_ocr_json(process_textlike_tables(raw))
                     st.session_state["main_result"] = result
                     st.session_state["main_error"] = ""
+                    st.session_state["main_triplets"] = None
+                    st.session_state["main_triplets_error"] = ""
             except Exception as exc:
                 st.session_state["main_result"] = None
                 st.session_state["main_error"] = str(exc)
@@ -1033,12 +1092,14 @@ def main():
             key="shot_upload",
         )
         rerun = st.button("Обработать скриншот", disabled=screenshot is None, key="shot_button")
-        if rerun and screenshot is not None:  # если не распозналось или распозналось плохо, можно попробовать загрузить просто скриншот таблицы с обработкой через детектор + OCR, иногда работает лучше
+        if rerun and screenshot is not None: # если не распозналось или распозналось плохо, можно попробовать загрузить просто скриншот таблицы с обработкой через детектор + OCR, иногда работает лучше
             try:
                 with st.spinner("Обрабатка..."):
                     shot_result = process_screenshot(screenshot.getvalue())
                     st.session_state["shot_result"] = shot_result
                     st.session_state["shot_error"] = ""
+                    st.session_state["screenshot_triplets"] = None
+                    st.session_state["screenshot_triplets_error"] = ""
             except Exception as exc:
                 st.session_state["shot_result"] = None
                 st.session_state["shot_error"] = str(exc)
